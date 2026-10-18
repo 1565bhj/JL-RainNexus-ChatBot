@@ -1,0 +1,21 @@
+#ifndef __NET_UPDATE_H__
+#define __NET_UPDATE_H__
+
+#define CONFIG_UPGRADE_OTA_FILE_NAME            "update-ota.ufw"
+#define CONFIG_UPGRADE_OTA_FILE_NAME_RES        "update-ota-res.ufw"
+
+#define OTA_VERSON          "V1"                            //版本管理
+
+//net_fopen支持写flash固件升级和写到SD卡，当名字字符有CCONFIG_UPGRADE_OTA_FILE_NAME时是固件升级
+void *net_fopen(char *path, char *mode);
+int net_fwrite(void *file, unsigned char *buf, int len, int end);
+int net_fread(void *file, char *buf, int len);
+int net_flen(void *file);
+int net_fclose(void *file, char is_socket_err);
+int net_update_request(void);
+
+/** 下拉页等 UI 展示用 OTA/固件版本字符串（与 OTA_VERSON 一致） */
+const char *net_update_get_ota_version(void);
+
+#endif
+

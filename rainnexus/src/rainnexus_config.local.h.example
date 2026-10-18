@@ -1,0 +1,8 @@
+/* Copy this file to rainnexus_config.local.h and fill in deployment values. */
+#ifndef RAINNEXUS_CONFIG_LOCAL_H
+#define RAINNEXUS_CONFIG_LOCAL_H
+
+#define RAINNEXUS_APP_KEY    "YOUR_RAINNEXUS_APP_KEY"
+#define RAINNEXUS_APP_SECRET "YOUR_RAINNEXUS_APP_SECRET"
+
+#endif
