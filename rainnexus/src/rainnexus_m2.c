@@ -8,6 +8,7 @@
 #include "web_socket/websocket_api.h"
 #include "web_socket/websocket_ssl.h"
 #include "wifi/wifi_connect.h"
+#include "fs/fs.h"
 #include "server/audio_server.h"
 #include "server/server_core.h"
 
@@ -20,6 +21,13 @@
 
 #define RAINNEXUS_M2_RX_JSON_CAPACITY  1024U
 #define RAINNEXUS_M3_SESSION_ID_CAPACITY 128U
+#define RAINNEXUS_M4_AUDIO_PACKET_CAPACITY 2048U
+#define RAINNEXUS_M4_OGG_STREAM_CAPACITY (128U * 1024U)
+#define RAINNEXUS_M4_OGG_OPEN_PREROLL 1024U
+#define RAINNEXUS_M4_OGG_PAGE_CAPACITY \
+    (27U + 1U + (RAINNEXUS_M4_AUDIO_PACKET_CAPACITY / 255U) + 1U + \
+     RAINNEXUS_M4_AUDIO_PACKET_CAPACITY)
+#define RAINNEXUS_M4_OGG_SERIAL 0x524e4f47UL
 
 enum {
     RAINNEXUS_M3_DISCONNECT_NONE = 0,
@@ -29,21 +37,10 @@ enum {
 };
 
 extern u32 get_malloc_remain_heap_size(void);
-
-typedef struct {
-    u8 data[RAINNEXUS_M4_AUDIO_PACKET_CAPACITY];
-    u16 len;
-    u16 offset;
-} rainnexus_m4_audio_packet_t;
+/* The active AC7916AB development board uses PC7 as active-low PA mute. */
+extern void dac_mute_control(char enable, char force);
 
 typedef struct rainnexus_m2_context rainnexus_m2_context_t;
-
-static int rainnexus_m4_audio_vfs_fread(void *file, void *data, u32 len);
-static int rainnexus_m4_audio_decoder_start(rainnexus_m2_context_t *ctx);
-
-static const struct audio_vfs_ops rainnexus_m4_audio_vfs_ops = {
-    .fread = rainnexus_m4_audio_vfs_fread,
-};
 
 struct rainnexus_m2_context {
     struct websocket_struct *ws;
@@ -61,114 +58,313 @@ struct rainnexus_m2_context {
     unsigned int audio_sample_rate;
     unsigned int audio_frame_duration;
     unsigned int audio_frame_samples;
-    rainnexus_m4_audio_packet_t *audio_packets;
-    u8 audio_read_index;
-    u8 audio_write_index;
-    volatile u8 audio_packet_count;
     volatile int audio_active;
-    volatile int audio_start_requested;
     volatile int audio_start_failed;
+    void *audio_decoder;
     OS_SEM audio_data_sem;
     int audio_sem_initialized;
-    void *audio_decoder;
+    volatile int audio_decoder_open_requested;
+    u8 *audio_ring_buffer;
+    u8 *audio_page;
     u8 *audio_fragment;
     unsigned int audio_fragment_len;
-    int audio_fragment_active;
+    int audio_binary_fragment_active;
     unsigned int audio_frames_received;
     unsigned int audio_frames_queued;
     unsigned int audio_frames_dropped;
     unsigned int audio_decode_errors;
+    unsigned int audio_vfs_read_calls;
+    unsigned int audio_vfs_read_bytes;
+    unsigned int audio_vfs_waits;
+    volatile unsigned int audio_vfs_offset;
+    unsigned int audio_vfs_seek_calls;
+    volatile unsigned int audio_ogg_stream_length;
+    unsigned int audio_tts_start_events;
+    unsigned int audio_tts_stop_events;
+    unsigned int audio_pcm_callbacks;
+    unsigned int audio_pcm_callbacks_reported;
+    unsigned int audio_pcm_nonzero_callbacks;
+    unsigned int audio_pcm_bytes;
+    unsigned int audio_pcm_peak;
+    unsigned int audio_pcm_sample_rate;
+    unsigned int audio_pcm_channels;
+    unsigned int audio_ogg_sequence;
+    u64 audio_ogg_granule;
+    int audio_ogg_headers_written;
     int ws_initialized;
 };
 
 /* 目标 SDK 的接收回调没有 priv 参数；M2 只允许存在一个验证连接。 */
 static rainnexus_m2_context_t *g_m2_context;
 
-static int rainnexus_m4_audio_enqueue(rainnexus_m2_context_t *ctx,
-                                      const u8 *data, unsigned int len)
+static u32 rainnexus_m4_ogg_crc(const u8 *data, unsigned int len)
 {
-    rainnexus_m4_audio_packet_t *packet;
-    u8 next_index;
+    u32 crc = 0;
+    unsigned int i;
+    unsigned int bit;
 
-#if !RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    /* Raw Opus is intentionally sinked until a safe decoder path is verified. */
-    if (ctx != NULL && data != NULL && len != 0U) {
-        ctx->audio_frames_dropped++;
-    }
-    return 0;
-#endif
-
-    if (ctx == NULL || data == NULL || len == 0U ||
-        len > RAINNEXUS_M4_AUDIO_PACKET_CAPACITY ||
-        !ctx->audio_active || !ctx->audio_sem_initialized) {
-        return 0;
-    }
-    if (ctx->audio_packet_count >= RAINNEXUS_M4_AUDIO_QUEUE_DEPTH) {
-        ctx->audio_frames_dropped++;
-        if (ctx->audio_frames_dropped == 1U ||
-            (ctx->audio_frames_dropped % 10U) == 0U) {
-            printf("[RN-M4] audio queue full; dropped=%u\n",
-                   ctx->audio_frames_dropped);
+    for (i = 0U; i < len; i++) {
+        crc ^= (u32)data[i] << 24;
+        for (bit = 0U; bit < 8U; bit++) {
+            crc = (crc & 0x80000000UL) ?
+                  (crc << 1) ^ 0x04c11db7UL : crc << 1;
         }
+    }
+    return crc;
+}
+
+static void rainnexus_m4_ogg_write_le32(u8 *dst, u32 value)
+{
+    dst[0] = (u8)value;
+    dst[1] = (u8)(value >> 8);
+    dst[2] = (u8)(value >> 16);
+    dst[3] = (u8)(value >> 24);
+}
+
+static void rainnexus_m4_ogg_write_le64(u8 *dst, u64 value)
+{
+    unsigned int i;
+
+    for (i = 0U; i < 8U; i++) {
+        dst[i] = (u8)(value >> (i * 8U));
+    }
+}
+
+/* One Ogg page carries exactly one Opus packet. */
+static int rainnexus_m4_ogg_write_page(rainnexus_m2_context_t *ctx,
+                                        const u8 *packet,
+                                        unsigned int packet_len,
+                                        u8 header_type,
+                                        u64 granule)
+{
+    unsigned int segments;
+    unsigned int page_len;
+    unsigned int index;
+    unsigned int remaining;
+    u32 crc;
+
+    if (ctx == NULL || packet == NULL || packet_len == 0U ||
+        packet_len > RAINNEXUS_M4_AUDIO_PACKET_CAPACITY ||
+        ctx->audio_page == NULL || ctx->audio_ring_buffer == NULL) {
+        return -1;
+    }
+    segments = packet_len / 255U + 1U;
+    page_len = 27U + segments + packet_len;
+    if (page_len > RAINNEXUS_M4_OGG_PAGE_CAPACITY ||
+        ctx->audio_ogg_stream_length >
+        RAINNEXUS_M4_OGG_STREAM_CAPACITY - page_len) {
+        return -1;
+    }
+
+    memset(ctx->audio_page, 0, page_len);
+    memcpy(ctx->audio_page, "OggS", 4U);
+    ctx->audio_page[4] = 0U;
+    ctx->audio_page[5] = header_type;
+    rainnexus_m4_ogg_write_le64(ctx->audio_page + 6U, granule);
+    rainnexus_m4_ogg_write_le32(ctx->audio_page + 14U, RAINNEXUS_M4_OGG_SERIAL);
+    rainnexus_m4_ogg_write_le32(ctx->audio_page + 18U,
+                                 ctx->audio_ogg_sequence);
+    ctx->audio_page[26] = (u8)segments;
+    remaining = packet_len;
+    for (index = 0U; index < segments; index++) {
+        unsigned int lace = remaining > 255U ? 255U : remaining;
+
+        ctx->audio_page[27U + index] = (u8)lace;
+        remaining -= lace;
+    }
+    memcpy(ctx->audio_page + 27U + segments, packet, packet_len);
+    crc = rainnexus_m4_ogg_crc(ctx->audio_page, page_len);
+    rainnexus_m4_ogg_write_le32(ctx->audio_page + 22U, crc);
+    memcpy(ctx->audio_ring_buffer + ctx->audio_ogg_stream_length,
+           ctx->audio_page, page_len);
+    ctx->audio_ogg_stream_length += page_len;
+    ctx->audio_ogg_sequence++;
+    return 0;
+}
+
+static int rainnexus_m4_ogg_write_headers(rainnexus_m2_context_t *ctx)
+{
+    static const u8 opus_head[] = {
+        'O', 'p', 'u', 's', 'H', 'e', 'a', 'd',
+        1, 1, 0, 0, 0x80, 0x3e, 0, 0, 0, 0, 0,
+    };
+    static const u8 opus_tags[] = {
+        'O', 'p', 'u', 's', 'T', 'a', 'g', 's',
+        9, 0, 0, 0, 'R', 'a', 'i', 'n', 'N', 'e', 'x', 'u', 's',
+        0, 0, 0, 0,
+    };
+
+    if (ctx->audio_ogg_headers_written) {
         return 0;
     }
-
-    packet = &ctx->audio_packets[ctx->audio_write_index];
-    memcpy(packet->data, data, len);
-    packet->len = (u16)len;
-    packet->offset = 0U;
-    next_index = (u8)(ctx->audio_write_index + 1U);
-    if (next_index >= RAINNEXUS_M4_AUDIO_QUEUE_DEPTH) {
-        next_index = 0U;
+    if (rainnexus_m4_ogg_write_page(ctx, opus_head, sizeof(opus_head),
+                                     0x02U, 0) != 0 ||
+        rainnexus_m4_ogg_write_page(ctx, opus_tags, sizeof(opus_tags),
+                                     0x00U, 0) != 0) {
+        return -1;
     }
-    ctx->audio_write_index = next_index;
-    ctx->audio_packet_count++;
-    ctx->audio_frames_queued++;
-    os_sem_post(&ctx->audio_data_sem);
-
-    /* Let the session task start the decoder outside the WebSocket callback. */
-#if RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    if (ctx->audio_decoder == NULL && !ctx->audio_start_failed) {
-        ctx->audio_start_requested = 1;
-    }
-#else
-    ctx->audio_frames_dropped++;
-#endif
-    return 1;
+    ctx->audio_ogg_headers_written = 1;
+    return 0;
 }
 
 static int rainnexus_m4_audio_vfs_fread(void *file, void *data, u32 len)
 {
     rainnexus_m2_context_t *ctx = (rainnexus_m2_context_t *)file;
-    rainnexus_m4_audio_packet_t *packet;
     u32 available;
-    u32 copy_len;
 
-    if (ctx == NULL || data == NULL || len == 0U || !ctx->audio_active ||
+    if (ctx == NULL || data == NULL || len == 0U ||
         !ctx->audio_sem_initialized) {
         return 0;
     }
-    while (ctx->audio_active && ctx->audio_packet_count == 0U) {
-        os_sem_pend(&ctx->audio_data_sem, RAINNEXUS_M4_AUDIO_READ_WAIT_TICKS);
+
+    /*
+     * Ogg parsing seeks back to the start of a page after scanning it, so
+     * retain the received stream for this bounded session instead of using a
+     * destructive FIFO.  Do not return a short read: Ogg Opus treats it as
+     * EOF.  When the requested range has not arrived yet, wait for the next
+     * WebSocket page.
+     */
+    while (ctx->audio_active) {
+        available = ctx->audio_ogg_stream_length - ctx->audio_vfs_offset;
+        if (available >= len) {
+            int read_len = (int)len;
+
+            memcpy(data, ctx->audio_ring_buffer + ctx->audio_vfs_offset, len);
+
+            ctx->audio_vfs_read_calls++;
+            ctx->audio_vfs_read_bytes += (unsigned int)read_len;
+            ctx->audio_vfs_offset += (unsigned int)read_len;
+            if (ctx->audio_vfs_read_calls <= 3U ||
+                (ctx->audio_vfs_read_calls % 32U) == 0U) {
+                printf("[RN-M4] Ogg VFS read: count=%u req=%u got=%u "
+                       "remain=%u\n", ctx->audio_vfs_read_calls,
+                       (unsigned int)len, (unsigned int)read_len,
+                       ctx->audio_ogg_stream_length - ctx->audio_vfs_offset);
+            }
+            return read_len;
+        }
+        ctx->audio_vfs_waits++;
+        os_sem_pend(&ctx->audio_data_sem, 0);
     }
-    if (!ctx->audio_active || ctx->audio_packet_count == 0U) {
+    return 0;
+}
+
+static int rainnexus_m4_audio_vfs_fseek(void *file, u32 offset, int seek_mode)
+{
+    rainnexus_m2_context_t *ctx = (rainnexus_m2_context_t *)file;
+    unsigned int target;
+
+    if (ctx == NULL || !ctx->audio_sem_initialized) {
+        return -1;
+    }
+    if (seek_mode == SEEK_SET) {
+        target = offset;
+    } else if (seek_mode == SEEK_CUR) {
+        target = ctx->audio_vfs_offset + offset;
+    } else if (seek_mode == SEEK_END) {
+        target = ctx->audio_ogg_stream_length + offset;
+    } else {
+        printf("[RN-M4] Ogg VFS invalid seek mode=%d\n", seek_mode);
+        return -1;
+    }
+    ctx->audio_vfs_seek_calls++;
+    while (ctx->audio_active && target > ctx->audio_ogg_stream_length) {
+        ctx->audio_vfs_waits++;
+        os_sem_pend(&ctx->audio_data_sem, 0);
+    }
+    if (!ctx->audio_active) {
+        return -1;
+    }
+    ctx->audio_vfs_offset = target;
+    if (ctx->audio_vfs_seek_calls <= 3U) {
+        printf("[RN-M4] Ogg VFS seek: target=%u stream=%u\n", target,
+               ctx->audio_ogg_stream_length);
+    }
+    return 0;
+}
+
+static int rainnexus_m4_audio_vfs_ftell(void *file)
+{
+    rainnexus_m2_context_t *ctx = (rainnexus_m2_context_t *)file;
+
+    return ctx != NULL ? (int)ctx->audio_vfs_offset : -1;
+}
+
+static int rainnexus_m4_audio_vfs_flen(void *file)
+{
+    rainnexus_m2_context_t *ctx = (rainnexus_m2_context_t *)file;
+
+    return ctx != NULL ? (int)ctx->audio_ogg_stream_length : -1;
+}
+
+static const struct audio_vfs_ops rainnexus_m4_audio_vfs_ops = {
+    .fread = rainnexus_m4_audio_vfs_fread,
+    .fseek = rainnexus_m4_audio_vfs_fseek,
+    .ftell = rainnexus_m4_audio_vfs_ftell,
+    .flen = rainnexus_m4_audio_vfs_flen,
+};
+
+/*
+ * The decoder invokes this after producing PCM and before it reaches DAC.
+ * Keep only aggregate level information: it diagnoses silent PCM without
+ * retaining or printing any spoken audio samples.
+ */
+static int rainnexus_m4_audio_pcm_callback(u8 *buf, u32 len,
+                                           u32 sample_rate, u8 ch_num)
+{
+    rainnexus_m2_context_t *ctx = g_m2_context;
+    unsigned int index;
+    unsigned int peak = 0U;
+
+    if (ctx == NULL || buf == NULL || len < 2U) {
         return 0;
     }
-    packet = &ctx->audio_packets[ctx->audio_read_index];
-    available = (u32)packet->len - packet->offset;
-    copy_len = available < len ? available : len;
-    memcpy(data, packet->data + packet->offset, copy_len);
-    packet->offset += (u16)copy_len;
-    if (packet->offset >= packet->len) {
-        packet->len = 0U;
-        packet->offset = 0U;
-        ctx->audio_read_index++;
-        if (ctx->audio_read_index >= RAINNEXUS_M4_AUDIO_QUEUE_DEPTH) {
-            ctx->audio_read_index = 0U;
+    for (index = 0U; index + 1U < len; index += 2U) {
+        s16 sample = (s16)((u16)buf[index] | ((u16)buf[index + 1U] << 8));
+        unsigned int magnitude = sample < 0 ? (unsigned int)(-(int)sample) :
+                                 (unsigned int)sample;
+
+        if (magnitude > peak) {
+            peak = magnitude;
         }
-        ctx->audio_packet_count--;
     }
-    return (int)copy_len;
+    ctx->audio_pcm_callbacks++;
+    ctx->audio_pcm_bytes += len;
+    ctx->audio_pcm_sample_rate = sample_rate;
+    ctx->audio_pcm_channels = ch_num;
+    if (peak != 0U) {
+        ctx->audio_pcm_nonzero_callbacks++;
+        if (peak > ctx->audio_pcm_peak) {
+            ctx->audio_pcm_peak = peak;
+        }
+    }
+    /*
+     * audio_server uses this callback's return value as the number of PCM
+     * bytes to continue through its DAC output path.  Returning zero only
+     * observes decoded samples; it also consumes them before they reach the
+     * speaker.  Keep the full block after collecting diagnostics.
+     */
+    return (int)len;
+}
+
+static void rainnexus_m4_audio_server_event(void *priv, int argc, int *argv)
+{
+    rainnexus_m2_context_t *ctx = (rainnexus_m2_context_t *)priv;
+
+    if (ctx == NULL || argc < 1 || argv == NULL) {
+        return;
+    }
+    if (argv[0] == AUDIO_SERVER_EVENT_ERR) {
+        ctx->audio_decode_errors++;
+    }
+    if (argv[0] == AUDIO_SERVER_EVENT_ERR ||
+        argv[0] == AUDIO_SERVER_EVENT_END) {
+        printf("[RN-M4] audio_server event=%d reads=%u bytes=%u waits=%u "
+               "seeks=%u buffered=%u\n", argv[0], ctx->audio_vfs_read_calls,
+               ctx->audio_vfs_read_bytes, ctx->audio_vfs_waits,
+               ctx->audio_vfs_seek_calls,
+               ctx->audio_ogg_stream_length - ctx->audio_vfs_offset);
+    }
 }
 
 static int rainnexus_m4_audio_decoder_start(rainnexus_m2_context_t *ctx)
@@ -179,134 +375,125 @@ static int rainnexus_m4_audio_decoder_start(rainnexus_m2_context_t *ctx)
     if (ctx == NULL || !ctx->audio_active || ctx->audio_decoder != NULL) {
         return -1;
     }
-    printf("[RN-M4] opening audio_server decoder\n");
     ctx->audio_decoder = server_open("audio_server", "dec");
     if (ctx->audio_decoder == NULL) {
-        printf("[RN-M4] Opus audio server open failed\n");
+        printf("[RN-M4] Ogg Opus audio_server open failed\n");
         return -1;
     }
-    printf("[RN-M4] audio_server decoder opened\n");
+    /*
+     * The normal application un-mutes the PA at boot, but make this audio
+     * path self-contained as a locked/latching mute GPIO would otherwise
+     * leave a healthy decoder and DAC completely silent.
+     */
+    dac_mute_control(0, 1);
+    printf("[RN-M4] speaker PA force-unmuted (PC7=high)\n");
+    server_register_event_handler_to_task(ctx->audio_decoder, ctx,
+                                          rainnexus_m4_audio_server_event,
+                                          "sys_timer");
     req.dec.cmd = AUDIO_DEC_OPEN;
     req.dec.volume = 80;
     req.dec.output_buf_len = 8U * 1024U;
     req.dec.priority = 1;
-    req.dec.channel = 1;
-    req.dec.sample_rate = ctx->audio_sample_rate;
+    req.dec.channel = 0;
+    req.dec.sample_rate = 0;
     req.dec.dec_type = "opus";
     req.dec.sample_source = "dac";
+    req.dec.attr = AUDIO_ATTR_OPUS_OGG_TYPE;
     req.dec.file = (FILE *)ctx;
     req.dec.vfs_ops = &rainnexus_m4_audio_vfs_ops;
-    printf("[RN-M4] sending AUDIO_DEC_OPEN: sr=%u channels=1 frame_ms=%u\n",
-           ctx->audio_sample_rate, ctx->audio_frame_duration);
+    req.dec.dec_callback = rainnexus_m4_audio_pcm_callback;
+    printf("[RN-M4] opening Ogg Opus decoder with buffered=%u bytes\n",
+           ctx->audio_ogg_stream_length - ctx->audio_vfs_offset);
     err = server_request(ctx->audio_decoder, AUDIO_REQ_DEC, &req);
     if (err != 0) {
-        printf("[RN-M4] Opus audio server open failed: %d\n", err);
+        printf("[RN-M4] Ogg Opus AUDIO_DEC_OPEN failed: %d\n", err);
         goto fail;
     }
-    printf("[RN-M4] AUDIO_DEC_OPEN completed\n");
     req.dec.cmd = AUDIO_DEC_START;
-    printf("[RN-M4] sending AUDIO_DEC_START\n");
     err = server_request(ctx->audio_decoder, AUDIO_REQ_DEC, &req);
     if (err != 0) {
-        printf("[RN-M4] Opus audio server start failed: %d\n", err);
+        printf("[RN-M4] Ogg Opus AUDIO_DEC_START failed: %d\n", err);
         goto fail;
     }
-    printf("[RN-M4] AUDIO_DEC_START completed\n");
-    printf("[RN-M4] downlink playback started: opus %u Hz mono %u ms\n",
-           ctx->audio_sample_rate, ctx->audio_frame_duration);
+    printf("[RN-M4] Ogg Opus decoder started: variable-length frames -> DAC\n");
     return 0;
 
 fail:
-    ctx->audio_active = 0;
-    os_sem_post(&ctx->audio_data_sem);
-    if (ctx->audio_decoder != NULL) {
-        req.dec.cmd = AUDIO_DEC_STOP;
-        server_request(ctx->audio_decoder, AUDIO_REQ_DEC, &req);
-        server_close(ctx->audio_decoder);
-        ctx->audio_decoder = NULL;
-    }
+    req.dec.cmd = AUDIO_DEC_STOP;
+    server_request(ctx->audio_decoder, AUDIO_REQ_DEC, &req);
+    server_close(ctx->audio_decoder);
+    ctx->audio_decoder = NULL;
     return -1;
 }
 
 static int rainnexus_m4_audio_start(rainnexus_m2_context_t *ctx)
 {
-#if RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    int err;
-#endif
-
     if (ctx == NULL || ctx->audio_sample_rate == 0U ||
         ctx->audio_frame_duration != 60U || ctx->audio_frame_samples == 0U) {
         return -1;
     }
 
-#if !RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    ctx->audio_active = 1;
-    printf("[RN-M4] audio sink ready; raw Opus decoder disabled for SDK safety\n");
-    return 0;
-#else
-    ctx->audio_packets = (rainnexus_m4_audio_packet_t *)malloc(
-        sizeof(rainnexus_m4_audio_packet_t) * RAINNEXUS_M4_AUDIO_QUEUE_DEPTH);
+    ctx->audio_ring_buffer = (u8 *)malloc(RAINNEXUS_M4_OGG_STREAM_CAPACITY);
+    ctx->audio_page = (u8 *)malloc(RAINNEXUS_M4_OGG_PAGE_CAPACITY);
     ctx->audio_fragment = (u8 *)malloc(RAINNEXUS_M4_AUDIO_PACKET_CAPACITY);
-    if (ctx->audio_packets == NULL || ctx->audio_fragment == NULL) {
-        printf("[RN-M4] audio buffer allocation failed\n");
+    if (ctx->audio_ring_buffer == NULL || ctx->audio_page == NULL ||
+        ctx->audio_fragment == NULL) {
+        printf("[RN-M4] Ogg Opus buffer allocation failed\n");
         goto fail_buffers;
     }
-    printf("[RN-M4] audio buffers allocated: heap=%u\n",
-           (unsigned int)get_malloc_remain_heap_size());
-    memset(ctx->audio_packets, 0,
-           sizeof(rainnexus_m4_audio_packet_t) * RAINNEXUS_M4_AUDIO_QUEUE_DEPTH);
-    printf("[RN-M4] creating audio queue semaphore\n");
-    err = os_sem_create(&ctx->audio_data_sem, 0);
-    if (err != 0) {
-        printf("[RN-M4] audio queue semaphore create failed: %d\n", err);
+    if (os_sem_create(&ctx->audio_data_sem, 0) != 0) {
+        printf("[RN-M4] Ogg Opus data semaphore create failed\n");
         goto fail_buffers;
     }
     ctx->audio_sem_initialized = 1;
     ctx->audio_active = 1;
-#if RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    printf("[RN-M4] audio queue semaphore ready; decoder waits for first Opus frame\n");
-#else
-    printf("[RN-M4] audio queue ready; raw Opus decoder disabled for SDK safety\n");
-#endif
+    printf("[RN-M4] Ogg Opus adapter ready: waiting for first variable-length frame\n");
     return 0;
 
 fail_buffers:
-    free(ctx->audio_packets);
+    free(ctx->audio_ring_buffer);
+    free(ctx->audio_page);
     free(ctx->audio_fragment);
-    ctx->audio_packets = NULL;
+    ctx->audio_ring_buffer = NULL;
+    ctx->audio_page = NULL;
     ctx->audio_fragment = NULL;
     return -1;
-#endif
 }
 
 static void rainnexus_m4_audio_stop(rainnexus_m2_context_t *ctx)
 {
-    union audio_req req = {0};
-
     if (ctx == NULL) {
         return;
     }
     ctx->audio_active = 0;
-    if (!ctx->audio_sem_initialized) {
-        return;
+    if (ctx->audio_sem_initialized) {
+        os_sem_post(&ctx->audio_data_sem);
     }
-    os_sem_post(&ctx->audio_data_sem);
     if (ctx->audio_decoder != NULL) {
+        union audio_req req = {0};
+
         req.dec.cmd = AUDIO_DEC_STOP;
         server_request(ctx->audio_decoder, AUDIO_REQ_DEC, &req);
         server_close(ctx->audio_decoder);
         ctx->audio_decoder = NULL;
     }
-    os_sem_del(&ctx->audio_data_sem, OS_DEL_ALWAYS);
-    ctx->audio_sem_initialized = 0;
-    free(ctx->audio_packets);
+    if (ctx->audio_sem_initialized) {
+        os_sem_del(&ctx->audio_data_sem, OS_DEL_ALWAYS);
+        ctx->audio_sem_initialized = 0;
+    }
+    free(ctx->audio_ring_buffer);
+    free(ctx->audio_page);
     free(ctx->audio_fragment);
-    ctx->audio_packets = NULL;
+    ctx->audio_ring_buffer = NULL;
+    ctx->audio_page = NULL;
     ctx->audio_fragment = NULL;
     printf("[RN-M4] playback stopped: received=%u queued=%u dropped=%u "
-           "decode_errors=%u\n",
+           "decode_errors=%u reads=%u bytes=%u waits=%u pcm=%u/%u peak=%u\n",
            ctx->audio_frames_received, ctx->audio_frames_queued,
-           ctx->audio_frames_dropped, ctx->audio_decode_errors);
+           ctx->audio_frames_dropped, ctx->audio_decode_errors,
+           ctx->audio_vfs_read_calls, ctx->audio_vfs_read_bytes,
+           ctx->audio_vfs_waits, ctx->audio_pcm_nonzero_callbacks,
+           ctx->audio_pcm_callbacks, ctx->audio_pcm_peak);
 }
 
 static void rainnexus_m4_audio_receive(rainnexus_m2_context_t *ctx,
@@ -315,49 +502,37 @@ static void rainnexus_m4_audio_receive(rainnexus_m2_context_t *ctx,
                                        u8 end_seq)
 {
     unsigned int remaining;
+    int page_written = 0;
 
     if (ctx == NULL || !ctx->hello_validated || !ctx->audio_active ||
         buf == NULL || len == 0U) {
         return;
     }
 
-#if !RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-    /* The safe bring-up sink has no audio buffer; never copy into it. */
-    if (opcode == WS_TYPE_BINDATA) {
-        ctx->audio_frames_received++;
-        ctx->audio_frames_dropped++;
-        if (ctx->audio_frames_received == 1U ||
-            (ctx->audio_frames_received % 20U) == 0U) {
-            printf("[RN-M4] binary Opus frame received and dropped: "
-                   "count=%u len=%u\n",
-                   ctx->audio_frames_received, (unsigned int)len);
-        }
-    }
-    return;
-#endif
-
+    /*
+     * RainNexus sends bare variable-length Opus packets.  Wrap each complete
+     * frame in an Ogg page so the documented Ogg Opus decoder keeps its frame
+     * boundaries without relying on the incompatible CBR mode.
+     */
     if (opcode == WS_TYPE_BINDATA) {
         ctx->audio_fragment_len = 0U;
-        ctx->audio_fragment_active = 1;
+        ctx->audio_binary_fragment_active = 1;
         if (payload_len > RAINNEXUS_M4_AUDIO_PACKET_CAPACITY) {
-            ctx->audio_fragment_active = 0;
+            ctx->audio_binary_fragment_active = 0;
             ctx->audio_frames_dropped++;
-            printf("[RN-M4] binary Opus frame too large: %u\n",
+            printf("[RN-M4] Opus frame exceeds Ogg adapter capacity: %u\n",
                    (unsigned int)payload_len);
             return;
         }
-    } else if (opcode != WS_TYPE_SEQ || !ctx->audio_fragment_active) {
+    } else if (opcode != WS_TYPE_SEQ || !ctx->audio_binary_fragment_active) {
         return;
     }
-
-    remaining = RAINNEXUS_M4_AUDIO_PACKET_CAPACITY -
-                ctx->audio_fragment_len;
+    remaining = RAINNEXUS_M4_AUDIO_PACKET_CAPACITY - ctx->audio_fragment_len;
     if (len > remaining) {
-        ctx->audio_fragment_active = 0;
+        ctx->audio_binary_fragment_active = 0;
         ctx->audio_fragment_len = 0U;
         ctx->audio_frames_dropped++;
-        printf("[RN-M4] binary Opus fragment overflow: %u\n",
-               (unsigned int)len);
+        printf("[RN-M4] Opus frame fragment overflow: %u\n", (unsigned int)len);
         return;
     }
     memcpy(ctx->audio_fragment + ctx->audio_fragment_len, buf, len);
@@ -371,15 +546,49 @@ static void rainnexus_m4_audio_receive(rainnexus_m2_context_t *ctx,
         return;
     }
 
-    ctx->audio_fragment_active = 0;
+    if (rainnexus_m4_ogg_write_headers(ctx) == 0) {
+        u64 next_granule = ctx->audio_ogg_granule +
+                           (u64)ctx->audio_frame_duration * 48U;
+
+        if (rainnexus_m4_ogg_write_page(ctx, ctx->audio_fragment,
+                                         ctx->audio_fragment_len,
+                                         0x00U, next_granule) == 0) {
+            ctx->audio_ogg_granule = next_granule;
+            page_written = 1;
+        }
+    }
+    ctx->audio_binary_fragment_active = 0;
     ctx->audio_frames_received++;
+    /*
+     * Log only a tiny format fingerprint.  This distinguishes a bare Opus
+     * packet from a service-specific wrapper without exposing audio payload.
+     */
     if (ctx->audio_frames_received == 1U ||
         (ctx->audio_frames_received % 20U) == 0U) {
-        printf("[RN-M4] binary Opus frame received: count=%u len=%u\n",
-               ctx->audio_frames_received, ctx->audio_fragment_len);
+        printf("[RN-M4] Opus packet format: count=%u len=%u toc=%02x "
+               "head=%02x%02x%02x%02x\n",
+               ctx->audio_frames_received, ctx->audio_fragment_len,
+               ctx->audio_fragment[0], ctx->audio_fragment[0],
+               ctx->audio_fragment_len > 1U ? ctx->audio_fragment[1] : 0U,
+               ctx->audio_fragment_len > 2U ? ctx->audio_fragment[2] : 0U,
+               ctx->audio_fragment_len > 3U ? ctx->audio_fragment[3] : 0U);
     }
-    rainnexus_m4_audio_enqueue(ctx, ctx->audio_fragment,
-                               ctx->audio_fragment_len);
+    if (page_written) {
+        ctx->audio_frames_queued++;
+        os_sem_post(&ctx->audio_data_sem);
+        if (ctx->audio_ogg_stream_length >= RAINNEXUS_M4_OGG_OPEN_PREROLL) {
+            ctx->audio_decoder_open_requested = 1;
+        }
+        if (ctx->audio_frames_received == 1U ||
+            (ctx->audio_frames_received % 20U) == 0U) {
+            printf("[RN-M4] Ogg Opus page queued: count=%u packet=%u\n",
+                   ctx->audio_frames_received, ctx->audio_fragment_len);
+        }
+    } else {
+        ctx->audio_frames_dropped++;
+        printf("[RN-M4] Ogg Opus page dropped: packet=%u\n",
+               ctx->audio_fragment_len);
+    }
     ctx->audio_fragment_len = 0U;
 }
 
@@ -564,8 +773,8 @@ static int rainnexus_m4_send_text_probe(rainnexus_m2_context_t *ctx)
         printf("[RN-M4] text probe send failed: %d\n", ret);
         return -1;
     }
-    printf("[RN-M4] text probe sent: bytes=%u\n",
-           (unsigned int)request_len);
+    printf("[RN-M4] TX JSON (%u bytes): %s\n",
+           (unsigned int)request_len, request);
     return 0;
 }
 
@@ -728,6 +937,65 @@ static int rainnexus_m2_string_equal_ci(const char *left, const char *right)
            rainnexus_m2_ascii_equal(left, right, left_len);
 }
 
+static int rainnexus_m2_json_key_is_sensitive(const char *key)
+{
+    return key != NULL &&
+           (rainnexus_m2_string_equal_ci(key, "token") ||
+            rainnexus_m2_string_equal_ci(key, "secret") ||
+            rainnexus_m2_string_equal_ci(key, "password") ||
+            rainnexus_m2_string_equal_ci(key, "authorization"));
+}
+
+static int rainnexus_m2_redact_json(cJSON *node)
+{
+    cJSON *child;
+
+    if (node == NULL || (!cJSON_IsObject(node) && !cJSON_IsArray(node))) {
+        return 1;
+    }
+    for (child = node->child; child != NULL; child = child->next) {
+        if (rainnexus_m2_json_key_is_sensitive(child->string) &&
+            cJSON_IsString(child)) {
+            if (cJSON_SetValuestring(child, "[REDACTED]") == NULL) {
+                return 0;
+            }
+        } else if (!rainnexus_m2_redact_json(child)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void rainnexus_m2_log_rx_json(const rainnexus_m2_context_t *ctx,
+                                     const cJSON *root)
+{
+    cJSON *safe_root;
+    char *safe_json;
+
+    safe_root = cJSON_Duplicate(root, 1);
+    if (safe_root == NULL) {
+        printf("[RN-M2] RX JSON (%u bytes): log copy unavailable\n",
+               ctx->rx_json_len);
+        return;
+    }
+    if (!rainnexus_m2_redact_json(safe_root)) {
+        printf("[RN-M2] RX JSON (%u bytes): redaction failed; content omitted\n",
+               ctx->rx_json_len);
+        cJSON_Delete(safe_root);
+        return;
+    }
+    safe_json = cJSON_PrintUnformatted(safe_root);
+    if (safe_json != NULL) {
+        printf("[RN-M2] RX JSON (%u bytes, credentials redacted): %s\n",
+               ctx->rx_json_len, safe_json);
+        cJSON_free(safe_json);
+    } else {
+        printf("[RN-M2] RX JSON (%u bytes): sanitized log unavailable\n",
+               ctx->rx_json_len);
+    }
+    cJSON_Delete(safe_root);
+}
+
 static int rainnexus_m2_error_is_token_expired(const cJSON *root)
 {
     const cJSON *code;
@@ -764,12 +1032,14 @@ static void rainnexus_m2_process_json(rainnexus_m2_context_t *ctx)
     cJSON *root;
     const cJSON *type;
     const cJSON *session_id;
+    const cJSON *tts_state;
 
     ctx->rx_json[ctx->rx_json_len] = '\0';
     root = cJSON_Parse(ctx->rx_json);
     if (root == NULL) {
         return;
     }
+    rainnexus_m2_log_rx_json(ctx, root);
 
     type = cJSON_GetObjectItemCaseSensitive(root, "type");
     if (rainnexus_m2_nonempty_json_string(type) &&
@@ -813,6 +1083,23 @@ static void rainnexus_m2_process_json(rainnexus_m2_context_t *ctx)
         } else {
             printf("[RN-M4] server JSON event received: type=unknown\n");
         }
+        if (rainnexus_m2_nonempty_json_string(type) &&
+            strcmp(type->valuestring, "tts") == 0) {
+            tts_state = cJSON_GetObjectItemCaseSensitive(root, "state");
+            if (rainnexus_m2_nonempty_json_string(tts_state) &&
+                strcmp(tts_state->valuestring, "start") == 0) {
+                ctx->audio_tts_start_events++;
+                printf("[RN-M4] TTS started\n");
+            } else if (rainnexus_m2_nonempty_json_string(tts_state) &&
+                       strcmp(tts_state->valuestring, "stop") == 0) {
+                ctx->audio_tts_stop_events++;
+                printf("[RN-M4] TTS stopped: frames=%u queued=%u dropped=%u "
+                       "nominal_ms=%u\n", ctx->audio_frames_received,
+                       ctx->audio_frames_queued, ctx->audio_frames_dropped,
+                       ctx->audio_frames_received *
+                       ctx->audio_frame_duration);
+            }
+        }
         ctx->rx_json_len = 0U;
     } else {
         printf("[RN-M2] received non-hello JSON; continue waiting\n");
@@ -852,7 +1139,7 @@ static void rainnexus_m2_ws_callback(u8 *buf, u32 len, u32 payload_len,
         return;
     }
     if (opcode == WS_TYPE_BINDATA ||
-        (opcode == WS_TYPE_SEQ && ctx->audio_fragment_active)) {
+        (opcode == WS_TYPE_SEQ && ctx->audio_binary_fragment_active)) {
         rainnexus_m4_audio_receive(ctx, buf, len, payload_len,
                                    type, opcode, end_seq);
         return;
@@ -882,10 +1169,12 @@ static void rainnexus_m2_ws_callback(u8 *buf, u32 len, u32 payload_len,
     if ((payload_len != 0U && ctx->rx_json_len >= payload_len) || end_seq) {
         if (!ctx->hello_validated &&
             ctx->hello_result == RAINNEXUS_M2_ERR_HELLO_TIMEOUT) {
-            printf("[RN-M2] server hello is not valid JSON\n");
+            printf("[RN-M2] RX invalid JSON (%u bytes); content omitted\n",
+                   ctx->rx_json_len);
             ctx->hello_result = RAINNEXUS_M2_ERR_SERVER_HELLO;
         } else if (ctx->hello_validated && ctx->rx_json_len != 0U) {
-            printf("[RN-M4] server JSON event is not valid JSON\n");
+            printf("[RN-M4] RX invalid JSON (%u bytes); content omitted\n",
+                   ctx->rx_json_len);
             ctx->rx_json_len = 0U;
         }
     }
@@ -1020,11 +1309,8 @@ static void rainnexus_m2_register_ws(struct websocket_struct *ws)
 
 static void rainnexus_m2_cleanup(rainnexus_m2_context_t *ctx)
 {
-    if (ctx->audio_sem_initialized) {
-        /* Stop accepting frames before waiting for the WebSocket task. */
-        ctx->audio_active = 0;
-        os_sem_post(&ctx->audio_data_sem);
-    }
+    /* Stop accepting frames before waiting for the WebSocket task. */
+    ctx->audio_active = 0;
     if (ctx->ws != NULL &&
         (ctx->ws->recv_thread_id != 0 || ctx->ws->ping_thread_id != 0)) {
         /* Invalidate and wake both SDK tasks before waiting for them. */
@@ -1054,7 +1340,7 @@ static void rainnexus_m2_cleanup(rainnexus_m2_context_t *ctx)
 int rainnexus_m2_run(const rainnexus_auth_result_t *auth)
 {
     static const char client_hello[] =
-        "{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\":true},"
+        "{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\":false},"
         "\"transport\":\"websocket\",\"audio_params\":{\"format\":\"opus\","
         "\"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}";
     rainnexus_m2_context_t ctx;
@@ -1141,7 +1427,8 @@ int rainnexus_m2_run(const rainnexus_auth_result_t *auth)
         ret = RAINNEXUS_M2_ERR_PING_TASK;
         goto cleanup;
     }
-    if (thread_fork("rnx_m2_recv", 18, 2048, 0, &ctx.ws->recv_thread_id,
+    /* JSON parsing and downlink-frame accounting run from this callback task. */
+    if (thread_fork("rnx_m2_recv", 18, 4096, 0, &ctx.ws->recv_thread_id,
                     ctx.ws->_recv_thread, ctx.ws) != OS_NO_ERR) {
         printf("[RN-M2] failed to create receive task\n");
         ret = RAINNEXUS_M2_ERR_RECV_TASK;
@@ -1155,6 +1442,8 @@ int rainnexus_m2_run(const rainnexus_auth_result_t *auth)
         ret = RAINNEXUS_M2_ERR_SEND_HELLO;
         goto cleanup;
     }
+    printf("[RN-M2] TX JSON (%u bytes): %s\n",
+           (unsigned int)(sizeof(client_hello) - 1U), client_hello);
     printf("[RN-M4] client hello sent; downlink audio enabled\n");
 
     while (!ctx.hello_validated &&
@@ -1188,21 +1477,28 @@ int rainnexus_m2_run(const rainnexus_auth_result_t *auth)
         while (!ctx.disconnected && !ctx.token_expired &&
                !ctx.audio_start_failed &&
                waited_ms < RAINNEXUS_M4_SESSION_TIMEOUT_MS) {
-            if (ctx.audio_start_requested && ctx.audio_decoder == NULL) {
-#if RAINNEXUS_M4_AUDIO_DECODER_ENABLE
-                ctx.audio_start_requested = 0;
+            if (ctx.audio_decoder_open_requested &&
+                ctx.audio_decoder == NULL) {
+                ctx.audio_decoder_open_requested = 0;
                 if (rainnexus_m4_audio_decoder_start(&ctx) != 0) {
                     ctx.audio_start_failed = 1;
                     ctx.audio_decode_errors++;
                     ctx.audio_active = 0;
-                    os_sem_post(&ctx.audio_data_sem);
                 }
-#else
-                ctx.audio_start_requested = 0;
-#endif
             }
             os_time_dly(1);
             waited_ms += 10U;
+            if ((waited_ms % 1000U) == 0U &&
+                ctx.audio_pcm_callbacks != 0U &&
+                ctx.audio_pcm_callbacks != ctx.audio_pcm_callbacks_reported) {
+                printf("[RN-M4] decoded PCM: blocks=%u nonzero=%u bytes=%u "
+                       "peak=%u sr=%u ch=%u\n",
+                       ctx.audio_pcm_callbacks,
+                       ctx.audio_pcm_nonzero_callbacks, ctx.audio_pcm_bytes,
+                       ctx.audio_pcm_peak, ctx.audio_pcm_sample_rate,
+                       ctx.audio_pcm_channels);
+                ctx.audio_pcm_callbacks_reported = ctx.audio_pcm_callbacks;
+            }
         }
         if (ctx.audio_start_failed) {
             printf("[RN-M4] downlink audio decoder failed after first frame\n");

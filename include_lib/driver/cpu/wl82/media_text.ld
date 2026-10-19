@@ -89,6 +89,9 @@
 #endif
 
 #if defined CONFIG_OPUS_DEC_ENABLE
+        /* Opus library uses custom section names; include them in .text so
+         * download.c's objcopy -j .text actually packages the decoder. */
+        *(.ogg_opus_dec.text*)
         *(.wtgv2dec_code)
         *(.wtg_decv2_sparse_code)
         *(.wtgv2dec_const)

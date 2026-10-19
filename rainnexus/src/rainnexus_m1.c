@@ -161,7 +161,8 @@ int rainnexus_start(void)
     if (g_rainnexus_m1_started) {
         return 0;
     }
-    ret = thread_fork("rainnexus_m1", 10, 3072, 0,
+    /* M2 keeps JSON, TLS and audio-session state on this call chain. */
+    ret = thread_fork("rainnexus_m1", 10, 8192, 0,
                       &g_rainnexus_m1_pid, rainnexus_m1_task, NULL);
     if (ret != OS_NO_ERR) {
         printf("[RN-M3] failed to create RainNexus task: %d\n", ret);
