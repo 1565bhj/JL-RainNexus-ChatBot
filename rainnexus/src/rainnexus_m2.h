@@ -1,6 +1,6 @@
 /**
  * @file rainnexus_m2.h
- * @brief RainNexus M2/M3 WebSocket 建连、hello 验证和协议会话
+ * @brief RainNexus M2/M5 WebSocket 建连、hello 验证和音频协议会话
  */
 
 #ifndef __RAINNEXUS_M2_H__

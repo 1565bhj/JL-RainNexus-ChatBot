@@ -93,6 +93,7 @@ include_lib/driver/format.sh
 rainnexus/src/rainnexus_config.local.h
 .vscode/
 **/log.txt
+cpu/wl82/tools/rainnexus-link-*.log
 stdout
 
 # Large local tools and generated media/resources

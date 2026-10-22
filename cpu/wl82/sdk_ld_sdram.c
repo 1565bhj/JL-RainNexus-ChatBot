@@ -64,6 +64,20 @@ SECTIONS
 #if !defined CONFIG_RF_TRIM_CODE_AT_RAM && !defined CONFIG_RF_TRIM_CODE_MOVABLE
         *(*.rf.text.cache.L2.rf_trim)
 #endif
+        /*
+         * The Opus encoder library keeps its hot code and tables in named
+         * cache-L2 input sections.  These names do not begin with ".text",
+         * so the generic *(.text*) rule above does not collect them.  Leaving
+         * them as orphan output sections places them beyond
+         * text_rodata_end; CPU1 then rejects the first Opus call as an
+         * illegal instruction.  Keep the complete encoder image in the
+         * normal executable range.
+         */
+        *(.opus_stenc.text.cache.L2.run)
+        *(.opus_silk_enc.text.cache.L2.run)
+        *(.opus_stenc.text)
+        *(.opus_silk_enc.text.cache.L2.const)
+        *(.opus_stenc.text.cache.L2.const)
         . = ALIGN(32);
         _text_rodata_end = .;
         PROVIDE(text_rodata_end = .);

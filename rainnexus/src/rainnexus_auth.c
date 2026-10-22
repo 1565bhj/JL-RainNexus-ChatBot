@@ -16,6 +16,7 @@
 #include "rainnexus_http.h"
 
 #define RAINNEXUS_STR_EMPTY(s) ((s) == NULL || (s)[0] == '\0')
+#define RAINNEXUS_LOG_M1_AUTH_RAW_JSON 1
 
 static rainnexus_auth_result_t g_auth_result;
 
@@ -139,6 +140,11 @@ int rainnexus_auth_login(void)
     }
 
     printf("[RN-M1] auth request: POST %s\n", RAINNEXUS_AUTH_URL);
+#if RAINNEXUS_LOG_M1_AUTH_RAW_JSON
+    /* Diagnostic mode: includes app_secret; disable after the capture. */
+    printf("[RN-M1] TX auth JSON RAW (%u bytes): %s\n",
+           (unsigned int)strlen(payload), payload);
+#endif
     raw = rainnexus_http_post_json_with_retry(
         RAINNEXUS_AUTH_URL,
         payload,
@@ -152,6 +158,11 @@ int rainnexus_auth_login(void)
         goto cleanup;
     }
 
+#if RAINNEXUS_LOG_M1_AUTH_RAW_JSON
+    /* Diagnostic mode: a successful response includes the access token. */
+    printf("[RN-M1] RX auth JSON RAW (%u bytes): %s\n",
+           (unsigned int)strlen(raw.body), raw.body);
+#endif
     response_root = cJSON_Parse(raw.body);
     if (!cJSON_IsObject(response_root)) {
         printf("[RN-M1] auth response is not valid JSON object\n");

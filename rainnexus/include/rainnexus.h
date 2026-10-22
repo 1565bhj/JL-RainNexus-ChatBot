@@ -13,8 +13,8 @@ extern "C" {
 /**
  * 启动 RainNexus 接入任务。
  *
- * M2 流程复用产品现有 Wi-Fi/DHCP/NTP，完成登录、WSS 建连和
- * hello 校验后停在验证态，不启动音频采集或播放。
+ * M5 流程复用产品现有 Wi-Fi/DHCP/NTP，完成登录、WSS 建连和
+ * hello 校验后，按 KEY_OK 事件控制麦克风采集和服务端音频播放。
  */
 int rainnexus_start(void);
 

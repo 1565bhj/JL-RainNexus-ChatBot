@@ -1,6 +1,6 @@
 /**
  * @file rainnexus_m1.c
- * @brief 精灵头项目的 RainNexus M1/M2 分阶段验证任务
+ * @brief 精灵头项目的 RainNexus M1/M5 分阶段验证任务
  */
 
 #include "system/includes.h"
@@ -41,12 +41,11 @@ static void rainnexus_init_cjson_hooks(void)
 
 static void rainnexus_log_boot_baseline(void)
 {
-    printf("[RN-M4] platform ready: active=RainNexus stage=%d\n",
-           RAINNEXUS_BRINGUP_STAGE);
-    printf("[RN-M4] heap baseline: free=%u capacity=%u bytes\n",
+    printf("[RN-M5] platform ready: active=RainNexus M5\n");
+    printf("[RN-M5] heap baseline: free=%u capacity=%u bytes\n",
            (unsigned int)get_malloc_remain_heap_size(),
            (unsigned int)MALLOC_SIZE);
-    printf("[RN-M4] login, WebSocket protocol session, heartbeat and downlink audio enabled\n");
+    printf("[RN-M5] login, WebSocket protocol session, audio uplink and downlink enabled\n");
 }
 
 static void rainnexus_wait_for_wifi(void)
@@ -117,7 +116,7 @@ static void rainnexus_m1_task(void *priv)
         ret = rainnexus_auth_login();
         if (ret != RAINNEXUS_AUTH_OK) {
             printf("[RN-M1] auth failed: error=%d\n", ret);
-            printf("[RN-M4] skipped because M1 authentication failed\n");
+            printf("[RN-M5] skipped because M1 authentication failed\n");
             break;
         }
 
@@ -126,29 +125,29 @@ static void rainnexus_m1_task(void *priv)
         printf("[RN-M1] expires_in=%u seconds\n", auth->expires_in);
         printf("[RN-M1] wss_url=%s\n", auth->wss_url);
         printf("[RN-M1] xiaozhi_url=%s\n", auth->xiaozhi_url);
-        printf("[RN-M4] M1 complete; starting WSS protocol session\n");
+        printf("[RN-M5] M1 complete; starting WSS protocol session\n");
         m2_ret = rainnexus_m2_run(auth);
         if (m2_ret == RAINNEXUS_M2_ERR_TOKEN_EXPIRED &&
             reconnects < RAINNEXUS_M3_MAX_RECONNECTS) {
             reconnects++;
-            printf("[RN-M4] token expired; returning to M1 (%u/%u)\n",
+            printf("[RN-M5] token expired; returning to M1 (%u/%u)\n",
                    reconnects, RAINNEXUS_M3_MAX_RECONNECTS);
             rainnexus_auth_clear();
             os_time_dly(100);
             continue;
         }
         if (m2_ret == RAINNEXUS_M2_OK) {
-            printf("[RN-M4] bounded downlink audio session complete\n");
+            printf("[RN-M5] bounded audio uplink/downlink session complete\n");
         } else if (m2_ret == RAINNEXUS_M2_ERR_TOKEN_EXPIRED) {
-            printf("[RN-M4] token expired; reconnect limit reached\n");
+            printf("[RN-M5] token expired; reconnect limit reached\n");
         } else {
-            printf("[RN-M4] protocol/audio session failed: error=%d\n",
+            printf("[RN-M5] protocol/audio session failed: error=%d\n",
                    m2_ret);
         }
         break;
     }
 
-    printf("[RN-M4] protocol state; microphone/upload remain disabled\n");
+    printf("[RN-M5] protocol state; key-controlled capture session finished\n");
     for (;;) {
         os_time_dly(100);
     }

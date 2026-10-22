@@ -117,9 +117,11 @@ const struct task_info task_info_table[] = {
     {"sys_event",           29,     SYS_EVENT_STK_SIZE,    0,                    sys_event_tcb_stk_q },
     {"systimer",            14,     SYSTIMER_STK_SIZE,     0,                    systimer_tcb_stk_q },
     {"sys_timer",            9,     SYS_TIMER_STK_SIZE,   SYS_TIMER_Q_SIZE,      sys_timer_tcb_stk_q },
-    {"audio_server",        16,      512,   64    },
+    /* Encoder format setup runs in audio_server and needs the larger stack. */
+    {"audio_server",        16,     1024,   64    },
     {"audio_mix",           28,      512,   0     },
-    {"audio_encoder",       25,      384,   64    },
+    /* Opus virtual-input setup uses more stack during audio_set_fmt. */
+    {"audio_encoder",       25,     1024,   64    },
     {"speex_encoder",       13,      512,   0     },
     {"mp3_encoder",         13,      768,   0     },
     {"opus_encoder",        13,     1536,   0     },
@@ -524,7 +526,7 @@ void app_main()
 #endif
 
 #ifdef RAINNEXUS_ENABLE
-    /* RainNexus M2 只验证登录、WSS 和 hello；不启动原云平台或音频。 */
+    /* RainNexus M5 接管登录、WSS 和音频链路；不启动原云平台。 */
     rainnexus_start();
 #else
     audio_app_mode_switch(NULL);
